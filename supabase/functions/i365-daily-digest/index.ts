@@ -4,6 +4,10 @@
 //   A) Gmail (gratis, sin dominio):  GMAIL_USER  y  GMAIL_APP_PASSWORD (contraseña de aplicación)
 //   B) Resend (requiere dominio):    RESEND_API_KEY  y  MAIL_FROM
 //   APP_URL (opcional)  URL del CRM
+// Modos de prueba (siempre requieren el secreto del cron):
+//   {"probe":true}            verifica la conexión SMTP, no envía
+//   {"dry":true}              calcula el resumen, no envía
+//   {"test_to":"mail@..."}    envía un mensaje de prueba a un integrante activo del equipo
 import { createClient } from "npm:@supabase/supabase-js@2";
 import nodemailer from "npm:nodemailer@6.9.16";
 
@@ -94,6 +98,44 @@ Deno.serve(async (req) => {
   }
   const appUrl = (Deno.env.get("APP_URL") ?? "https://crm-impulso-365.vercel.app").replace(/\/$/, "");
 
+  const transport = provider === "gmail" ? gmailTransport(gmailUser!, gmailPass!) : null;
+  const deliver = async (to: string, subject: string, html: string, text: string) => {
+    if (provider === "resend") {
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${resendKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ from: resendFrom, to: [to], subject, html, text }),
+      });
+      if (!res.ok) throw Object.assign(new Error("resend"), { code: `resend_${res.status}` });
+    } else {
+      await transport!.sendMail({ from: `Impulso 365 <${gmailUser}>`, to, subject, html, text });
+    }
+  };
+
+  // Mensaje de prueba a un integrante activo del equipo.
+  if (typeof body?.test_to === "string") {
+    const to = body.test_to.trim().toLowerCase();
+    const { data: m } = await supabase
+      .from("i365_team")
+      .select("full_name,email")
+      .eq("active", true)
+      .eq("email", to)
+      .maybeSingle();
+    if (!m) return json({ error: "not_a_team_member" }, 400);
+    const first = m.full_name.split(" ")[0];
+    try {
+      await deliver(
+        m.email,
+        "Impulso 365 · prueba del recordatorio diario",
+        `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#111"><h2>Hola ${esc(first)} 👋</h2><p>Este es un mensaje de <b>prueba</b>. Si lo estás leyendo, el recordatorio diario de seguimientos de Impulso 365 funciona.</p><p>Cada día hábil a las 09:00 vas a recibir tus seguimientos atrasados, de hoy y tus reuniones de la semana.</p><p><a href="${esc(appUrl)}/llamadas" style="background:#1be38b;color:#04130c;padding:10px 16px;border-radius:8px;text-decoration:none;font-weight:bold">Abrir el CRM</a></p></div>`,
+        `Hola ${first},\n\nEste es un mensaje de prueba. Si lo estás leyendo, el recordatorio diario de Impulso 365 funciona.\n\n${appUrl}/llamadas\n`,
+      );
+      return json({ test: "sent", provider });
+    } catch (e) {
+      return json({ test: "failed", code: (e as { code?: string }).code ?? "unknown" }, 502);
+    }
+  }
+
   const today = dayISO(new Date());
   const in7 = dayISO(new Date(Date.now() + 7 * 86_400_000));
 
@@ -110,7 +152,6 @@ Deno.serve(async (req) => {
   ]);
   if (team.error || prospects.error) return json({ error: "query_failed" }, 500);
 
-  const transport = provider === "gmail" ? gmailTransport(gmailUser!, gmailPass!) : null;
   const results: { member: string; overdue: number; today: number; meetings: number; sent: boolean; error?: string }[] = [];
 
   for (const m of team.data ?? []) {
@@ -138,18 +179,8 @@ Deno.serve(async (req) => {
     const entry = { member: first, overdue: overdue.length, today: todays.length, meetings: meetings.length, sent: false } as (typeof results)[number];
     if (!dry) {
       try {
-        if (provider === "resend") {
-          const res = await fetch("https://api.resend.com/emails", {
-            method: "POST",
-            headers: { Authorization: `Bearer ${resendKey}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ from: resendFrom, to: [m.email], subject, html, text }),
-          });
-          entry.sent = res.ok;
-          if (!res.ok) entry.error = `resend_${res.status}`;
-        } else {
-          await transport!.sendMail({ from: `Impulso 365 <${gmailUser}>`, to: m.email, subject, html, text });
-          entry.sent = true;
-        }
+        await deliver(m.email, subject, html, text);
+        entry.sent = true;
       } catch (e) {
         entry.error = `send_failed_${(e as { code?: string }).code ?? "unknown"}`;
       }
