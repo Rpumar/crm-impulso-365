@@ -192,6 +192,9 @@ function ProspectsView() {
               </button>
             ))}
           </div>
+          <Link href="/prospectos/importar" className="btn-ghost">
+            Importar CSV
+          </Link>
           <button
             className="btn-ghost"
             disabled={rows.length === 0}
